@@ -15,20 +15,24 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GH_ACCESS_TOKEN }}
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.21'
+
       - name: Set env
         run: |
           echo "MESHERY_CLOUD_BASE_URL=https://meshery.layer5.io" >> $GITHUB_ENV
           echo "MESHERY_CATALOG_FILES_DIR=catalog" >> $GITHUB_ENV
+
       - name: Cleanup
         run: |
           find $MESHERY_CATALOG_FILES_DIR ! -name 'index.html' ! -name 'artifacthub-repo.yml' -maxdepth 1 -type f -delete
           cd ./collections/_catalog
           for dir in */; do find $dir -maxdepth 1 -type f -delete; done
           cd ../../
+
       - id: update_catalog_patterns
         name: Update Catalog Patterns in Go
         run: |
@@ -36,95 +40,88 @@ jobs:
           go run package.go
         env:
           GH_ACCESS_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
+
       - name: Update Catalog Filters
         if: ${{ success() }}
         run: |
           catalogFilters=$(curl -sS "$MESHERY_CLOUD_BASE_URL/api/catalog/content/filter" 2>./err.txt)
-          if [[ "$(<err.txt)" != "" ]]; then
-            >&2 echo "Error connecting to Meshery Cloud"
-            >&2 echo "$(<err.txt)"
+          if [[ -s err.txt ]]; then
+            echo "Error connecting to Meshery Cloud" >&2
+            cat err.txt >&2
+            exit 1
           fi
 
           echo "$catalogFilters" | jq -r '.filters' > temp.json
-          filterCount=$(echo "$catalogFilters" | jq '.total_count')
-          echo "Found $filterCount catalog filters"
-
+          filterCount=$(jq '.total_count' temp.json)
           echo "Found $filterCount catalog filters"
 
           for (( idx=0; idx<$filterCount; idx++ ))
           do
             filterId=$(jq -r .[$idx].id temp.json)
-            filterInfo="$(jq -r .[$idx].catalog_data.filter_info temp.json)"
-            filterCaveats="$(jq -r .[$idx].catalog_data.filter_caveats temp.json)"
-            filterType="$(jq -r .[$idx].catalog_data.type temp.json)"
-            filterName="$(jq -r .[$idx].name temp.json)"
-            filterImageURL="$(jq -r .[$idx].catalog_data.imageURL temp.json)"
-
+            filterInfo=$(jq -r .[$idx].catalog_data.filter_info temp.json)
+            filterCaveats=$(jq -r .[$idx].catalog_data.filter_caveats temp.json)
+            filterType=$(jq -r .[$idx].catalog_data.type temp.json)
+            filterName=$(jq -r .[$idx].name temp.json)
+            filterImageURL=$(jq -r .[$idx].catalog_data.imageURL temp.json)
             compatibility=""
-            echo "contentID=$designId" >> $GITHUB_OUTPUT
-            # check if directory doesn't exists; then create it
-            if [ ! -d "./collections/_catalog/"$(echo $filterType | tr '[:upper:]' '[:lower:]')"" ]; then
-              echo "$(echo $filterType | tr '[:upper:]' '[:lower:]') doesn't exist."
-               echo "Creating directory...$(echo $filterType | tr '[:upper:]' '[:lower:]')"
-              mkdir "./collections/_catalog/"$(echo $filterType | tr '[:upper:]' '[:lower:]')""
-            fi
 
-            if [[ $filterInfo == "null" ]]; then
-              filterInfo="\"\""
-            fi
-
-            if [[ $filterCaveats == "null" ]]; then
-              filterCaveats="\"\""
-            fi
-
-            if [[ $filterType == "null" ]]; then
-              patternType="wasm filter"
-            fi
+            # Normalize empty fields to prevent YAML errors
+            filterInfo=${filterInfo:-""}
+            filterCaveats=${filterCaveats:-""}
+            filterType=${filterType:-"wasm filter"}
 
             compatLength=$(jq -r ".[$idx].catalog_data.compatibility | length" temp.json)
-
             for (( compatIdx=0; compatIdx<$compatLength; compatIdx++ ))
             do
-              compatibility+="
-              "
-              compatibility+="    - $(jq -r ".[$idx].catalog_data.compatibility[$compatIdx]" temp.json)"
+              compatibility+="    - $(jq -r ".[$idx].catalog_data.compatibility[$compatIdx]" temp.json)\n"
             done
 
-            filterFile="$(jq -r .[$idx].filter_file temp.json)"
+            filterFile=$(jq -r .[$idx].filter_file temp.json)
             echo "$filterFile" > $MESHERY_CATALOG_FILES_DIR/$filterId.yaml
 
             userId=$(jq -r .[$idx].user_id temp.json)
             userInfo=$(curl -sS "$MESHERY_CLOUD_BASE_URL/api/identity/users/profile/$userId" 2>>./err.txt)
 
-            if [[ "$(<err.txt)" != "" ]]; then
-              >&2 echo "Error fetching User details"
-              >&2 echo "$(<err.txt)"
+            if [[ -s err.txt ]]; then
+              echo "Error fetching User details" >&2
+              cat err.txt >&2
+              exit 1
             fi
 
-            echo "$userInfo" > info.json
-
             userFullName="$(jq -r .first_name info.json) $(jq -r .last_name info.json)"
-            userAvatarURL="$(jq -r .avatar_url info.json)"
+            userAvatarURL=$(jq -r .avatar_url info.json)
 
-            echo "---
-          layout: item
-          name: $filterName
-          userId: $userId
-          userName: $userFullName
-          userAvatarURL: $userAvatarURL
-          type: $filterType
-          compatibility: $compatibility
-          patternId: $filterId
-          image: /assets/images/webassembly_logo.svg
-          filterInfo: |
-            $filterInfo
-          filterCaveats: |
-            $filterCaveats
-          URL: 'https://raw.githubusercontent.com/meshery/meshery.io/master/$MESHERY_CATALOG_FILES_DIR/$filterId.yaml'
-          downloadLink: $filterId.yaml
-          ---" > ./collections/_catalog/"$(echo $filterType | tr '[:upper:]' '[:lower:]')"/$filterId.md
+            # Ensure directory exists
+            filterDir="./collections/_catalog/$(echo $filterType | tr '[:upper:]' '[:lower:]')"
+            mkdir -p "$filterDir"
+
+            # Write the catalog item to a markdown file
+            cat <<EOF > "$filterDir/$filterId.md"
+---
+layout: item
+name: $filterName
+userId: $userId
+userName: $userFullName
+userAvatarURL: $userAvatarURL
+type: $filterType
+compatibility: |
+$compatibility
+patternId: $filterId
+image: /assets/images/webassembly_logo.svg
+filterInfo: |
+  $filterInfo
+filterCaveats: |
+  $filterCaveats
+URL: 'https://raw.githubusercontent.com/meshery/meshery.io/master/$MESHERY_CATALOG_FILES_DIR/$filterId.yaml'
+downloadLink: $filterId.yaml
+---
+EOF
           done
           rm temp.json
+
+      - name: Pull changes from remote
+        run: git pull origin master
+
       - name: Commit
         uses: stefanzweifel/git-auto-commit-action@v4
         with:
@@ -134,6 +131,7 @@ jobs:
           commit_author: ${{ github.actor }} <${{ github.actor }}@users.noreply.github.com>
           commit_options: '--signoff'
           commit_message: '[Catalog] Update Catalog items'
+
       - name: Send Email on Workflow Failure
         if: ${{ failure() }}
         uses: dawidd6/action-send-mail@v3.7.1
@@ -148,5 +146,4 @@ jobs:
           to: developers@meshery.io
           body: |
             Meshery's Add Cloud Native Catalog Items <a href="https://github.com/meshery/meshery.io/actions/workflows/add-catalog.yml">workflow</a> encountered error(s). Refer to the attached error log for details or review the [results of the failed workflow](https://github.com/meshery/meshery.io/actions/runs/${{ github.run_id }}).
-
           attachments: err.txt
